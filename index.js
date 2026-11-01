@@ -231,30 +231,24 @@ async function deletePresetsWithBackup(names) {
         return false;
     }
 
-    // 확인 창이 떠 있는 동안 다른 탭에서 저장됐다면 백업과 내용이 다르므로 지우지 않는다
-    let after;
-    try {
-        after = await fetchServerPresets();
-    } catch (error) {
-        console.error('[Preset Tidy] recheck failed', error);
-        toastr.error(`삭제 직전 확인에 실패해 취소했습니다. ${error?.message ?? error}`, '프리셋 정리');
-        return false;
-    }
-    const changed = toDelete.filter(name => after.get(name) !== before.get(name));
-    if (changed.length) {
-        toastr.warning(`백업 이후 내용이 바뀌어 건너뜁니다: ${changed.join(', ')}`, '프리셋 정리');
-    }
-
     const failed = [];
+    const changed = [];
     const needReload = [];
     let deleted = 0;
-    for (const name of toDelete.filter(name => !changed.includes(name))) {
+    for (const name of toDelete) {
         // 확인 창이 떠 있는 동안 선택 프리셋이 바뀌었을 수도 있으므로 매번 다시 확인
         if (name === getPresetManager().getSelectedPresetName()) {
             failed.push(name);
             continue;
         }
         try {
+            // 다른 탭에서 저장됐다면 백업과 내용이 다르므로 지우지 않는다.
+            // 지우기 바로 전에 하나씩 다시 읽는다. (서버 삭제 API는 내용을 비교하지 않는다)
+            const latest = await fetchServerPresets();
+            if (latest.get(name) !== before.get(name)) {
+                changed.push(name);
+                continue;
+            }
             const result = await deleteOnePreset(name);
             if (result === 'failed') {
                 failed.push(name);
@@ -271,6 +265,7 @@ async function deletePresetsWithBackup(names) {
     ctx().saveSettingsDebounced();
     if (deleted) toastr.success(`프리셋 ${deleted}개를 삭제했습니다.`, '프리셋 정리');
     if (failed.length) toastr.error(`삭제하지 못한 프리셋: ${failed.join(', ')}`, '프리셋 정리');
+    if (changed.length) toastr.warning(`백업 이후 내용이 바뀌어 건너뛰었습니다: ${changed.join(', ')}`, '프리셋 정리');
     if (needReload.length) toastr.warning(`삭제 중에 선택된 프리셋이 있습니다. 페이지를 새로고침하세요: ${needReload.join(', ')}`, '프리셋 정리');
     return true;
 }
