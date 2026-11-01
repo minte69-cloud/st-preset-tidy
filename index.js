@@ -66,7 +66,8 @@ function getPresetRows() {
  * 걸러진 결과가 원래 이름과 다르면 엉뚱한 파일이 지워질 수 있으므로 그런 이름은 다루지 않는다.
  */
 function isSafePresetName(name) {
-    if (!name || name.length > 255) return false;
+    // sanitize-filename은 UTF-16 글자 수가 아니라 UTF-8 255바이트로 자른다
+    if (!name || new TextEncoder().encode(name).length > 255) return false;
     if (/[/?<>\\:*|"]/.test(name)) return false;
     // eslint-disable-next-line no-control-regex
     if (/[\x00-\x1f\x80-\x9f]/.test(name)) return false;
@@ -90,12 +91,37 @@ function timestamp() {
 }
 
 /**
- * 메모리에 있는 프리셋 내용(= 마지막으로 저장된 내용)으로 zip을 만들어 다운로드시킨다.
- * 하나라도 내용을 못 찾으면 예외를 던져 삭제를 막는다.
+ * 서버에 지금 저장된 CC 프리셋 파일 내용을 그대로 읽어온다.
+ * 이 탭의 메모리는 다른 탭에서 저장한 내용보다 오래됐을 수 있어서, 백업은 항상 서버 기준으로 만든다.
+ * @returns {Promise<Map<string, string>>} 이름 → 파일 원문
+ */
+async function fetchServerPresets() {
+    const response = await fetch('/api/settings/get', {
+        method: 'POST',
+        headers: ctx().getRequestHeaders(),
+        body: JSON.stringify({}),
+        cache: 'no-cache',
+    });
+    if (!response.ok) {
+        throw new Error(`서버에서 프리셋을 읽지 못했습니다. (HTTP ${response.status})`);
+    }
+    const data = await response.json();
+    const names = data?.openai_setting_names;
+    const contents = data?.openai_settings;
+    if (!Array.isArray(names) || !Array.isArray(contents) || names.length !== contents.length) {
+        throw new Error('서버 응답 형식이 예상과 다릅니다.');
+    }
+    return new Map(names.map((name, i) => [name, contents[i]]));
+}
+
+/**
+ * 서버에서 읽은 파일 원문으로 zip을 만들어 다운로드시킨다.
+ * 하나라도 내용이 없으면 예외를 던져 삭제를 막는다.
+ * @param {string[]} names
+ * @param {Map<string, string>} serverFiles
  * @returns {Promise<string>} 다운로드한 파일 이름
  */
-async function downloadBackupZip(names) {
-    const { presets, preset_names } = getPresetManager().getPresetList();
+async function downloadBackupZip(names, serverFiles) {
     const JSZip = await loadJSZip();
     if (!JSZip) {
         throw new Error('JSZip을 불러오지 못했습니다.');
@@ -103,11 +129,11 @@ async function downloadBackupZip(names) {
 
     const zip = new JSZip();
     for (const name of names) {
-        const preset = presets[preset_names[name]];
-        if (!preset || typeof preset !== 'object') {
+        const raw = serverFiles.get(name);
+        if (typeof raw !== 'string') {
             throw new Error(`"${name}" 프리셋 내용을 찾지 못했습니다.`);
         }
-        zip.file(`${name}.json`, JSON.stringify(preset, null, 4));
+        zip.file(`${name}.json`, raw);
     }
 
     const blob = await zip.generateAsync({ type: 'blob' });
@@ -126,6 +152,7 @@ async function downloadBackupZip(names) {
 /**
  * 프리셋 하나를 서버에서 지운 뒤, 성공했을 때만 드롭다운과 이름 목록에서 뺀다.
  * (기본 deletePreset은 서버 응답 전에 화면에서 먼저 빼서, 실패하면 화면과 파일이 어긋난다)
+ * @returns {Promise<'deleted'|'failed'|'deletedButSelected'>}
  */
 async function deleteOnePreset(name) {
     const pm = getPresetManager();
@@ -135,17 +162,25 @@ async function deleteOnePreset(name) {
         body: JSON.stringify({ apiId: API_ID, name }),
     });
     if (!response.ok) {
-        return false;
+        return 'failed';
+    }
+
+    const { eventSource, eventTypes } = ctx();
+    await eventSource.emit(eventTypes.PRESET_DELETED, { apiId: API_ID, name });
+
+    // 요청 중에 이 프리셋이 선택됐다면 화면을 건드리지 않는다 (선택 상태와 설정이 어긋나지 않게)
+    if (name === pm.getSelectedPresetName()) {
+        return 'deletedButSelected';
     }
 
     const { preset_names } = pm.getPresetList();
     const index = preset_names[name];
-    delete preset_names[name];
-    $(pm.select).find('option').filter((_, el) => el.value === String(index) && el.text === name).remove();
-
-    const { eventSource, eventTypes } = ctx();
-    await eventSource.emit(eventTypes.PRESET_DELETED, { apiId: API_ID, name });
-    return true;
+    if (index !== undefined) {
+        delete preset_names[name];
+        // option.text는 연속 공백을 줄이므로 이름이 아니라 value(배열 위치)로 찾는다
+        $(pm.select).find('option').filter((_, el) => el.value === String(index)).remove();
+    }
+    return 'deleted';
 }
 
 /**
@@ -167,19 +202,28 @@ async function deletePresetsWithBackup(names) {
     }
 
     let fileName;
+    let before;
+    let toDelete;
     try {
-        fileName = await downloadBackupZip(safe);
+        before = await fetchServerPresets();
+        const missing = safe.filter(name => !before.has(name));
+        if (missing.length) {
+            toastr.warning(`서버에 파일이 없어 건너뜁니다: ${missing.join(', ')}`, '프리셋 정리');
+        }
+        toDelete = safe.filter(name => before.has(name));
+        if (!toDelete.length) return false;
+        fileName = await downloadBackupZip(toDelete, before);
     } catch (error) {
         console.error('[Preset Tidy] backup failed', error);
         toastr.error(`백업을 만들지 못해 삭제를 취소했습니다. ${error?.message ?? error}`, '프리셋 정리');
         return false;
     }
 
-    const list = safe.map(name => `<li>${escapeHtml(name)}</li>`).join('');
+    const list = toDelete.map(name => `<li>${escapeHtml(name)}</li>`).join('');
     const confirmed = await callGenericPopup(`
         <div class="preset-tidy-confirm">
-            <h3>프리셋 ${safe.length}개를 삭제할까요?</h3>
-            <p>백업 파일 <b>${escapeHtml(fileName)}</b> 이 다운로드됐는지 먼저 확인하세요.<br>삭제는 되돌릴 수 없습니다.</p>
+            <h3>프리셋 ${toDelete.length}개를 삭제할까요?</h3>
+            <p>백업 파일 <b>${escapeHtml(fileName)}</b> 이 실제로 저장됐는지 먼저 확인하세요.<br>삭제는 되돌릴 수 없습니다.</p>
             <ul>${list}</ul>
         </div>`, POPUP_TYPE.CONFIRM, '', { okButton: '삭제', cancelButton: '취소', allowVerticalScrolling: true });
 
@@ -187,17 +231,37 @@ async function deletePresetsWithBackup(names) {
         return false;
     }
 
+    // 확인 창이 떠 있는 동안 다른 탭에서 저장됐다면 백업과 내용이 다르므로 지우지 않는다
+    let after;
+    try {
+        after = await fetchServerPresets();
+    } catch (error) {
+        console.error('[Preset Tidy] recheck failed', error);
+        toastr.error(`삭제 직전 확인에 실패해 취소했습니다. ${error?.message ?? error}`, '프리셋 정리');
+        return false;
+    }
+    const changed = toDelete.filter(name => after.get(name) !== before.get(name));
+    if (changed.length) {
+        toastr.warning(`백업 이후 내용이 바뀌어 건너뜁니다: ${changed.join(', ')}`, '프리셋 정리');
+    }
+
     const failed = [];
+    const needReload = [];
     let deleted = 0;
-    for (const name of safe) {
+    for (const name of toDelete.filter(name => !changed.includes(name))) {
         // 확인 창이 떠 있는 동안 선택 프리셋이 바뀌었을 수도 있으므로 매번 다시 확인
         if (name === getPresetManager().getSelectedPresetName()) {
             failed.push(name);
             continue;
         }
         try {
-            if (await deleteOnePreset(name)) deleted++;
-            else failed.push(name);
+            const result = await deleteOnePreset(name);
+            if (result === 'failed') {
+                failed.push(name);
+            } else {
+                deleted++;
+                if (result === 'deletedButSelected') needReload.push(name);
+            }
         } catch (error) {
             console.error('[Preset Tidy] delete failed', name, error);
             failed.push(name);
@@ -207,6 +271,7 @@ async function deletePresetsWithBackup(names) {
     ctx().saveSettingsDebounced();
     if (deleted) toastr.success(`프리셋 ${deleted}개를 삭제했습니다.`, '프리셋 정리');
     if (failed.length) toastr.error(`삭제하지 못한 프리셋: ${failed.join(', ')}`, '프리셋 정리');
+    if (needReload.length) toastr.warning(`삭제 중에 선택된 프리셋이 있습니다. 페이지를 새로고침하세요: ${needReload.join(', ')}`, '프리셋 정리');
     return true;
 }
 
@@ -223,9 +288,10 @@ function applyArchiveToDropdown() {
     const select = getDropdown();
     if (!select) return;
     const archived = new Set(getSettings().archived);
-    const current = select.selectedOptions[0]?.text;
+    // option.text는 연속 공백을 줄이므로, 프리셋 관리자(jQuery .text())와 같은 textContent로 비교한다
+    const current = select.selectedOptions[0]?.textContent;
     for (const option of select.options) {
-        const hide = archived.has(option.text) && option.text !== current;
+        const hide = archived.has(option.textContent) && option.textContent !== current;
         if (option.hidden !== hide) option.hidden = hide;
     }
 }
@@ -439,7 +505,7 @@ function createTidyView(root) {
     });
 
     render();
-    return { render, selectedNames };
+    return { render, selectedNames, isBusy: () => busy };
 }
 
 async function openTidyWindow() {
@@ -447,8 +513,9 @@ async function openTidyWindow() {
     const root = document.createElement('div');
     root.className = 'preset-tidy';
 
+    let view;
     try {
-        createTidyView(root);
+        view = createTidyView(root);
     } catch (error) {
         console.error('[Preset Tidy]', error);
         toastr.error(String(error?.message ?? error), '프리셋 정리');
@@ -460,6 +527,14 @@ async function openTidyWindow() {
         wide: true,
         large: true,
         allowVerticalScrolling: true,
+        // 작업 중에 창을 닫으면 뒤의 드롭다운에서 지우는 중인 프리셋을 고를 수 있으므로 막는다
+        onClosing: () => {
+            if (view.isBusy()) {
+                toastr.info('작업이 끝난 뒤에 닫을 수 있습니다.', '프리셋 정리');
+                return false;
+            }
+            return true;
+        },
     });
     await popup.show();
 }
