@@ -210,8 +210,86 @@ async function deletePresetsWithBackup(names) {
     return true;
 }
 
+function getDropdown() {
+    return /** @type {HTMLSelectElement|null} */ (document.getElementById('settings_preset_openai'));
+}
+
+/**
+ * 보관한 프리셋의 <option>에 hidden을 붙인다. 파일과 <option> 자체는 그대로 두므로
+ * /preset 명령어와 연결 프로필은 보관한 프리셋도 계속 찾을 수 있다.
+ * 현재 선택된 프리셋은 숨기지 않는다. (iOS Safari는 option hidden을 무시한다)
+ */
+function applyArchiveToDropdown() {
+    const select = getDropdown();
+    if (!select) return;
+    const archived = new Set(getSettings().archived);
+    const current = select.selectedOptions[0]?.text;
+    for (const option of select.options) {
+        const hide = archived.has(option.text) && option.text !== current;
+        if (option.hidden !== hide) option.hidden = hide;
+    }
+}
+
+function setArchived(names, archive) {
+    const settings = getSettings();
+    const set = new Set(settings.archived);
+    for (const name of names) {
+        if (archive) set.add(name);
+        else set.delete(name);
+    }
+    settings.archived = [...set];
+    ctx().saveSettingsDebounced();
+    applyArchiveToDropdown();
+}
+
+async function archivePresets(names) {
+    const current = getPresetManager().getSelectedPresetName();
+    const targets = names.filter(name => name !== current);
+    if (!targets.length) return false;
+    setArchived(targets, true);
+    toastr.success(`프리셋 ${targets.length}개를 보관함으로 옮겼습니다.`, '프리셋 정리');
+    return true;
+}
+
+async function unarchivePresets(names) {
+    if (!names.length) return false;
+    setArchived(names, false);
+    toastr.success(`프리셋 ${names.length}개를 보관함에서 꺼냈습니다.`, '프리셋 정리');
+    return true;
+}
+
+/** 드롭다운에 <option>이 추가·삭제될 때(저장, 가져오기, 이름 변경 등)마다 숨김을 다시 적용한다. */
+function watchDropdown() {
+    const select = getDropdown();
+    if (select) {
+        // childList만 본다. hidden 속성 변경은 감시 대상이 아니라서 무한 반복이 생기지 않는다.
+        new MutationObserver(applyArchiveToDropdown).observe(select, { childList: true });
+    }
+
+    const { eventSource, eventTypes } = ctx();
+    eventSource.on(eventTypes.OAI_PRESET_CHANGED_AFTER, applyArchiveToDropdown);
+    eventSource.on(eventTypes.SETTINGS_LOADED, applyArchiveToDropdown);
+    eventSource.on(eventTypes.PRESET_RENAMED, ({ apiId, oldName, newName }) => {
+        if (apiId !== API_ID) return;
+        const settings = getSettings();
+        if (!settings.archived.includes(oldName)) return;
+        settings.archived = settings.archived.map(name => name === oldName ? newName : name);
+        ctx().saveSettingsDebounced();
+        applyArchiveToDropdown();
+    });
+    eventSource.on(eventTypes.PRESET_DELETED, ({ apiId, name }) => {
+        if (apiId !== API_ID) return;
+        const settings = getSettings();
+        if (!settings.archived.includes(name)) return;
+        settings.archived = settings.archived.filter(x => x !== name);
+        ctx().saveSettingsDebounced();
+    });
+}
+
 function createTidyView(root) {
     const state = {
+        /** @type {'active'|'archived'} */
+        tab: 'active',
         query: '',
         /** @type {Set<string>} */
         selected: new Set(),
@@ -219,6 +297,10 @@ function createTidyView(root) {
 
     root.innerHTML = `
         <h3>프리셋 정리 <small>(Chat Completion)</small></h3>
+        <div class="preset-tidy-tabs">
+            <div class="menu_button preset-tidy-tab" data-tab="active">프리셋</div>
+            <div class="menu_button preset-tidy-tab" data-tab="archived">보관함</div>
+        </div>
         <div class="preset-tidy-toolbar">
             <input type="search" class="text_pole preset-tidy-search" placeholder="이름 검색">
         </div>
@@ -236,6 +318,12 @@ function createTidyView(root) {
         </div>
         <div class="preset-tidy-actions">
             <span class="preset-tidy-count"></span>
+            <div class="menu_button menu_button_icon preset-tidy-archive" title="드롭다운에서 숨기기 (파일은 그대로)">
+                <i class="fa-solid fa-box-archive"></i><span>보관</span>
+            </div>
+            <div class="menu_button menu_button_icon preset-tidy-unarchive" title="드롭다운에 다시 보이기">
+                <i class="fa-solid fa-box-open"></i><span>꺼내기</span>
+            </div>
             <div class="menu_button menu_button_icon preset-tidy-delete" title="선택한 프리셋을 백업 후 삭제">
                 <i class="fa-solid fa-trash-can"></i><span>삭제</span>
             </div>
@@ -247,7 +335,9 @@ function createTidyView(root) {
 
     function visibleRows() {
         const query = state.query.trim().toLowerCase();
-        return getPresetRows().filter(row => !query || row.name.toLowerCase().includes(query));
+        const wantArchived = state.tab === 'archived';
+        return getPresetRows().filter(row => row.archived === wantArchived
+            && (!query || row.name.toLowerCase().includes(query)));
     }
 
     /** 실제로 작업 대상이 되는 이름들: 선택됐고, 지금 보이고, 사용 중이 아닌 것 */
@@ -279,7 +369,15 @@ function createTidyView(root) {
                     </td>
                     <td class="preset-tidy-num">${row.promptCount}</td>
                 </tr>`).join('')
-            : '<tr><td colspan="3" class="preset-tidy-empty">프리셋이 없습니다.</td></tr>';
+            : `<tr><td colspan="3" class="preset-tidy-empty">${state.tab === 'archived' ? '보관한 프리셋이 없습니다.' : '프리셋이 없습니다.'}</td></tr>`;
+
+        const archivedCount = getPresetRows().filter(row => row.archived).length;
+        root.querySelectorAll('.preset-tidy-tab').forEach(tab => {
+            tab.classList.toggle('active', tab.dataset.tab === state.tab);
+        });
+        $('.preset-tidy-tab[data-tab="archived"]').textContent = `보관함 (${archivedCount})`;
+        $('.preset-tidy-archive').style.display = state.tab === 'active' ? '' : 'none';
+        $('.preset-tidy-unarchive').style.display = state.tab === 'archived' ? '' : 'none';
 
         const count = selectable.filter(row => state.selected.has(row.name)).length;
         allBox.checked = selectable.length > 0 && count === selectable.length;
@@ -306,6 +404,17 @@ function createTidyView(root) {
     }
 
     $('.preset-tidy-delete').addEventListener('click', () => runAction(deletePresetsWithBackup));
+    $('.preset-tidy-archive').addEventListener('click', () => runAction(archivePresets));
+    $('.preset-tidy-unarchive').addEventListener('click', () => runAction(unarchivePresets));
+
+    root.querySelectorAll('.preset-tidy-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            if (busy || state.tab === tab.dataset.tab) return;
+            state.tab = /** @type {'active'|'archived'} */ (tab.dataset.tab);
+            state.selected.clear();
+            render();
+        });
+    });
 
     $('.preset-tidy-search').addEventListener('input', (e) => {
         state.query = e.target.value;
@@ -368,4 +477,6 @@ function addWandMenuItem() {
 jQuery(() => {
     getSettings();
     addWandMenuItem();
+    watchDropdown();
+    applyArchiveToDropdown();
 });

@@ -17,6 +17,21 @@
     font-weight: normal;
 }
 
+.preset-tidy-tabs {
+    display: flex;
+    gap: 4px;
+}
+
+.preset-tidy-tab {
+    margin: 0;
+    opacity: 0.6;
+}
+
+.preset-tidy-tab.active {
+    opacity: 1;
+    border-color: var(--SmartThemeQuoteColor);
+}
+
 .preset-tidy-toolbar,
 .preset-tidy-actions {
     display: flex;
