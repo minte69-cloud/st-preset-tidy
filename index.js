@@ -270,6 +270,129 @@ async function deletePresetsWithBackup(names) {
     return true;
 }
 
+/**
+ * Windows·macOS 파일 시스템은 대소문자(와 일부 악센트)를 구분하지 않는다.
+ * "a"를 "A"로 바꾸면 새로 저장한 파일이 곧 원본이라 원본 삭제 단계에서 둘 다 사라지므로, 이렇게 비교해 막는다.
+ */
+function sameFileName(a, b) {
+    const norm = (s) => s.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase();
+    return norm(a) === norm(b);
+}
+
+/**
+ * 새 이름으로 저장 → 서버에 그대로 저장됐는지 확인 → 원본 삭제.
+ * 새 파일이 확인되기 전에는 아무것도 지우지 않는다. 현재 선택된 프리셋은 실리태번 기본 이름 변경 버튼을 쓴다.
+ * @returns {Promise<boolean>} 이름을 바꿨으면 true
+ */
+async function renamePresetSafely(names) {
+    const { Popup, eventSource, eventTypes } = ctx();
+    const title = '프리셋 정리';
+    if (names.length !== 1) {
+        toastr.info('이름 변경은 한 번에 하나만 할 수 있습니다.', title);
+        return false;
+    }
+    const oldName = names[0];
+    const pm = getPresetManager();
+    if (oldName === pm.getSelectedPresetName()) {
+        toastr.info('현재 사용 중인 프리셋은 실리태번의 기본 이름 변경 버튼(연필)을 써 주세요.', title);
+        return false;
+    }
+
+    const input = await Popup.show.input('프리셋 이름 변경', '새 이름:', oldName);
+    const newName = typeof input === 'string' ? input.trim() : '';
+    if (!newName || newName === oldName) {
+        return false;
+    }
+    if (!isSafePresetName(oldName) || !isSafePresetName(newName)) {
+        toastr.warning('파일 이름으로 쓸 수 없는 문자나 너무 긴 이름은 쓸 수 없습니다.', title);
+        return false;
+    }
+    if (sameFileName(oldName, newName)) {
+        toastr.warning('대소문자나 악센트만 다른 이름으로는 바꿀 수 없습니다. 다른 이름을 거쳐서 두 번 바꿔 주세요.', title);
+        return false;
+    }
+
+    try {
+        const before = await fetchServerPresets();
+        const raw = before.get(oldName);
+        if (typeof raw !== 'string') {
+            throw new Error(`서버에 "${oldName}" 파일이 없습니다.`);
+        }
+        const { preset_names } = pm.getPresetList();
+        const taken = [...before.keys(), ...Object.keys(preset_names)].some(name => sameFileName(name, newName));
+        if (taken) {
+            toastr.warning(`"${newName}" 이름의 프리셋이 이미 있습니다.`, title);
+            return false;
+        }
+
+        const preset = JSON.parse(raw);
+        await eventSource.emit(eventTypes.PRESET_RENAMED_BEFORE, { apiId: API_ID, oldName, newName });
+
+        const saveResponse = await fetch('/api/presets/save', {
+            method: 'POST',
+            headers: ctx().getRequestHeaders(),
+            body: JSON.stringify({ apiId: API_ID, name: newName, preset }),
+        });
+        if (!saveResponse.ok) {
+            throw new Error(`새 이름으로 저장하지 못했습니다. (HTTP ${saveResponse.status})`);
+        }
+        const saved = await saveResponse.json();
+        if (saved?.name !== newName) {
+            throw new Error(`서버가 이름을 "${saved?.name}"(으)로 바꿔 저장했습니다. 원본은 그대로 두었습니다.`);
+        }
+
+        // 새 파일이 실제로 같은 내용인지, 그 사이 원본이 바뀌지 않았는지 확인한 뒤에만 원본을 지운다
+        const after = await fetchServerPresets();
+        const newRaw = after.get(newName);
+        if (typeof newRaw !== 'string' || JSON.stringify(JSON.parse(newRaw)) !== JSON.stringify(preset)) {
+            throw new Error('새 파일 확인에 실패했습니다. 원본은 그대로 두었습니다.');
+        }
+        const oldUnchanged = after.get(oldName) === raw;
+        let oldDeleted = false;
+        if (oldUnchanged && oldName !== pm.getSelectedPresetName()) {
+            const deleteResponse = await fetch('/api/presets/delete', {
+                method: 'POST',
+                headers: ctx().getRequestHeaders(),
+                body: JSON.stringify({ apiId: API_ID, name: oldName }),
+            });
+            oldDeleted = deleteResponse.ok;
+        }
+
+        // 화면(메모리·드롭다운) 갱신
+        const { presets } = pm.getPresetList();
+        const oldIndex = preset_names[oldName];
+        const option = $(pm.select).find('option').filter((_, el) => el.value === String(oldIndex))[0];
+        if (oldDeleted && oldIndex !== undefined && option) {
+            // 원본 자리를 그대로 새 이름에 넘긴다
+            presets[oldIndex] = preset;
+            preset_names[newName] = oldIndex;
+            delete preset_names[oldName];
+            option.textContent = newName;
+        } else {
+            presets.push(preset);
+            preset_names[newName] = presets.length - 1;
+            const newOption = document.createElement('option');
+            newOption.value = String(presets.length - 1);
+            newOption.textContent = newName;
+            $(pm.select).append(newOption);
+        }
+
+        if (oldDeleted) {
+            await eventSource.emit(eventTypes.PRESET_RENAMED, { apiId: API_ID, oldName, newName });
+            toastr.success(`"${oldName}" → "${newName}"`, title);
+        } else {
+            toastr.warning(`"${newName}"(으)로 복사는 됐지만 원본 "${oldName}"은 지우지 못했습니다${oldUnchanged ? '' : ' (그 사이 원본이 바뀜)'}. 확인 후 직접 정리해 주세요.`, title);
+        }
+        applyArchiveToDropdown();
+        ctx().saveSettingsDebounced();
+        return true;
+    } catch (error) {
+        console.error('[Preset Tidy] rename failed', error);
+        toastr.error(String(error?.message ?? error), title);
+        return false;
+    }
+}
+
 function getDropdown() {
     return /** @type {HTMLSelectElement|null} */ (document.getElementById('settings_preset_openai'));
 }
@@ -385,6 +508,9 @@ function createTidyView(root) {
             <div class="menu_button menu_button_icon preset-tidy-unarchive" title="드롭다운에 다시 보이기">
                 <i class="fa-solid fa-box-open"></i><span>꺼내기</span>
             </div>
+            <div class="menu_button menu_button_icon preset-tidy-rename" title="선택한 프리셋 하나의 이름 바꾸기">
+                <i class="fa-solid fa-pencil"></i><span>이름 변경</span>
+            </div>
             <div class="menu_button menu_button_icon preset-tidy-delete" title="선택한 프리셋을 백업 후 삭제">
                 <i class="fa-solid fa-trash-can"></i><span>삭제</span>
             </div>
@@ -448,6 +574,7 @@ function createTidyView(root) {
         root.querySelectorAll('.preset-tidy-actions .menu_button').forEach(button => {
             button.classList.toggle('disabled', count === 0 || busy);
         });
+        $('.preset-tidy-rename').classList.toggle('disabled', count !== 1 || busy);
     }
 
     let busy = false;
@@ -465,6 +592,7 @@ function createTidyView(root) {
     }
 
     $('.preset-tidy-delete').addEventListener('click', () => runAction(deletePresetsWithBackup));
+    $('.preset-tidy-rename').addEventListener('click', () => runAction(renamePresetSafely));
     $('.preset-tidy-archive').addEventListener('click', () => runAction(archivePresets));
     $('.preset-tidy-unarchive').addEventListener('click', () => runAction(unarchivePresets));
 
