@@ -312,6 +312,7 @@ async function renamePresetSafely(names) {
         return false;
     }
 
+    let savedNew = false;
     try {
         const before = await fetchServerPresets();
         const raw = before.get(oldName);
@@ -326,8 +327,6 @@ async function renamePresetSafely(names) {
         }
 
         const preset = JSON.parse(raw);
-        await eventSource.emit(eventTypes.PRESET_RENAMED_BEFORE, { apiId: API_ID, oldName, newName });
-
         const saveResponse = await fetch('/api/presets/save', {
             method: 'POST',
             headers: ctx().getRequestHeaders(),
@@ -340,6 +339,7 @@ async function renamePresetSafely(names) {
         if (saved?.name !== newName) {
             throw new Error(`서버가 이름을 "${saved?.name}"(으)로 바꿔 저장했습니다. 원본은 그대로 두었습니다.`);
         }
+        savedNew = true;
 
         // 새 파일이 실제로 같은 내용인지, 그 사이 원본이 바뀌지 않았는지 확인한 뒤에만 원본을 지운다
         const after = await fetchServerPresets();
@@ -350,12 +350,24 @@ async function renamePresetSafely(names) {
         const oldUnchanged = after.get(oldName) === raw;
         let oldDeleted = false;
         if (oldUnchanged && oldName !== pm.getSelectedPresetName()) {
-            const deleteResponse = await fetch('/api/presets/delete', {
-                method: 'POST',
-                headers: ctx().getRequestHeaders(),
-                body: JSON.stringify({ apiId: API_ID, name: oldName }),
-            });
-            oldDeleted = deleteResponse.ok;
+            // 정규식 확장은 BEFORE 이벤트에서 허용 상태를 새 이름으로 옮긴다. 원본을 실제로 지우기 직전에만 보내고,
+            // 지우지 못했으면 반대로 한 번 더 보내 되돌린다.
+            await eventSource.emit(eventTypes.PRESET_RENAMED_BEFORE, { apiId: API_ID, oldName, newName });
+            try {
+                const deleteResponse = await fetch('/api/presets/delete', {
+                    method: 'POST',
+                    headers: ctx().getRequestHeaders(),
+                    body: JSON.stringify({ apiId: API_ID, name: oldName }),
+                });
+                oldDeleted = deleteResponse.ok;
+            } catch (error) {
+                // 응답만 잃어버렸을 수 있으니 서버에 원본이 남았는지 직접 확인한다
+                console.warn('[Preset Tidy] delete response lost, rechecking', error);
+                oldDeleted = !(await fetchServerPresets()).has(oldName);
+            }
+            if (!oldDeleted) {
+                await eventSource.emit(eventTypes.PRESET_RENAMED_BEFORE, { apiId: API_ID, oldName: newName, newName: oldName });
+            }
         }
 
         // 화면(메모리·드롭다운) 갱신
@@ -388,7 +400,8 @@ async function renamePresetSafely(names) {
         return true;
     } catch (error) {
         console.error('[Preset Tidy] rename failed', error);
-        toastr.error(String(error?.message ?? error), title);
+        const hint = savedNew ? ' 새 이름 파일은 서버에 저장됐을 수 있으니 페이지를 새로고침해 확인해 주세요.' : '';
+        toastr.error(String(error?.message ?? error) + hint, title);
         return false;
     }
 }
