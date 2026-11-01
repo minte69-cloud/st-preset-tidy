@@ -61,6 +61,155 @@ function getPresetRows() {
         .sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/**
+ * 서버는 이름을 sanitize-filename으로 거른 뒤 파일을 지운다.
+ * 걸러진 결과가 원래 이름과 다르면 엉뚱한 파일이 지워질 수 있으므로 그런 이름은 다루지 않는다.
+ */
+function isSafePresetName(name) {
+    if (!name || name.length > 255) return false;
+    if (/[/?<>\\:*|"]/.test(name)) return false;
+    // eslint-disable-next-line no-control-regex
+    if (/[\x00-\x1f\x80-\x9f]/.test(name)) return false;
+    if (/^\.+$/.test(name)) return false;
+    if (/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i.test(name)) return false;
+    if (/[. ]+$/.test(name)) return false;
+    return true;
+}
+
+async function loadJSZip() {
+    if (!('JSZip' in window)) {
+        await import('/lib/jszip.min.js');
+    }
+    return window.JSZip;
+}
+
+function timestamp() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
+/**
+ * 메모리에 있는 프리셋 내용(= 마지막으로 저장된 내용)으로 zip을 만들어 다운로드시킨다.
+ * 하나라도 내용을 못 찾으면 예외를 던져 삭제를 막는다.
+ * @returns {Promise<string>} 다운로드한 파일 이름
+ */
+async function downloadBackupZip(names) {
+    const { presets, preset_names } = getPresetManager().getPresetList();
+    const JSZip = await loadJSZip();
+    if (!JSZip) {
+        throw new Error('JSZip을 불러오지 못했습니다.');
+    }
+
+    const zip = new JSZip();
+    for (const name of names) {
+        const preset = presets[preset_names[name]];
+        if (!preset || typeof preset !== 'object') {
+            throw new Error(`"${name}" 프리셋 내용을 찾지 못했습니다.`);
+        }
+        zip.file(`${name}.json`, JSON.stringify(preset, null, 4));
+    }
+
+    const blob = await zip.generateAsync({ type: 'blob' });
+    const fileName = `preset-tidy-backup-${timestamp()}.zip`;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    return fileName;
+}
+
+/**
+ * 프리셋 하나를 서버에서 지운 뒤, 성공했을 때만 드롭다운과 이름 목록에서 뺀다.
+ * (기본 deletePreset은 서버 응답 전에 화면에서 먼저 빼서, 실패하면 화면과 파일이 어긋난다)
+ */
+async function deleteOnePreset(name) {
+    const pm = getPresetManager();
+    const response = await fetch('/api/presets/delete', {
+        method: 'POST',
+        headers: ctx().getRequestHeaders(),
+        body: JSON.stringify({ apiId: API_ID, name }),
+    });
+    if (!response.ok) {
+        return false;
+    }
+
+    const { preset_names } = pm.getPresetList();
+    const index = preset_names[name];
+    delete preset_names[name];
+    $(pm.select).find('option').filter((_, el) => el.value === String(index) && el.text === name).remove();
+
+    const { eventSource, eventTypes } = ctx();
+    await eventSource.emit(eventTypes.PRESET_DELETED, { apiId: API_ID, name });
+    return true;
+}
+
+/**
+ * 백업 zip 다운로드 → 확인 창 → 삭제
+ * @returns {Promise<boolean>} 삭제를 시도했으면 true
+ */
+async function deletePresetsWithBackup(names) {
+    const { callGenericPopup, POPUP_TYPE } = ctx();
+    const current = getPresetManager().getSelectedPresetName();
+    const targets = names.filter(name => name !== current);
+    const unsafe = targets.filter(name => !isSafePresetName(name));
+    const safe = targets.filter(name => isSafePresetName(name));
+
+    if (unsafe.length) {
+        toastr.warning(`이름에 특수 문자가 있어 이 도구로는 지울 수 없습니다: ${unsafe.join(', ')}`, '프리셋 정리');
+    }
+    if (!safe.length) {
+        return false;
+    }
+
+    let fileName;
+    try {
+        fileName = await downloadBackupZip(safe);
+    } catch (error) {
+        console.error('[Preset Tidy] backup failed', error);
+        toastr.error(`백업을 만들지 못해 삭제를 취소했습니다. ${error?.message ?? error}`, '프리셋 정리');
+        return false;
+    }
+
+    const list = safe.map(name => `<li>${escapeHtml(name)}</li>`).join('');
+    const confirmed = await callGenericPopup(`
+        <div class="preset-tidy-confirm">
+            <h3>프리셋 ${safe.length}개를 삭제할까요?</h3>
+            <p>백업 파일 <b>${escapeHtml(fileName)}</b> 이 다운로드됐는지 먼저 확인하세요.<br>삭제는 되돌릴 수 없습니다.</p>
+            <ul>${list}</ul>
+        </div>`, POPUP_TYPE.CONFIRM, '', { okButton: '삭제', cancelButton: '취소', allowVerticalScrolling: true });
+
+    if (!confirmed) {
+        return false;
+    }
+
+    const failed = [];
+    let deleted = 0;
+    for (const name of safe) {
+        // 확인 창이 떠 있는 동안 선택 프리셋이 바뀌었을 수도 있으므로 매번 다시 확인
+        if (name === getPresetManager().getSelectedPresetName()) {
+            failed.push(name);
+            continue;
+        }
+        try {
+            if (await deleteOnePreset(name)) deleted++;
+            else failed.push(name);
+        } catch (error) {
+            console.error('[Preset Tidy] delete failed', name, error);
+            failed.push(name);
+        }
+    }
+
+    ctx().saveSettingsDebounced();
+    if (deleted) toastr.success(`프리셋 ${deleted}개를 삭제했습니다.`, '프리셋 정리');
+    if (failed.length) toastr.error(`삭제하지 못한 프리셋: ${failed.join(', ')}`, '프리셋 정리');
+    return true;
+}
+
 function createTidyView(root) {
     const state = {
         query: '',
@@ -87,6 +236,9 @@ function createTidyView(root) {
         </div>
         <div class="preset-tidy-actions">
             <span class="preset-tidy-count"></span>
+            <div class="menu_button menu_button_icon preset-tidy-delete" title="선택한 프리셋을 백업 후 삭제">
+                <i class="fa-solid fa-trash-can"></i><span>삭제</span>
+            </div>
         </div>`;
 
     const $ = (selector) => root.querySelector(selector);
@@ -134,7 +286,26 @@ function createTidyView(root) {
         allBox.indeterminate = count > 0 && count < selectable.length;
         allBox.disabled = selectable.length === 0;
         $('.preset-tidy-count').textContent = `${rows.length}개 중 ${count}개 선택`;
+        root.querySelectorAll('.preset-tidy-actions .menu_button').forEach(button => {
+            button.classList.toggle('disabled', count === 0 || busy);
+        });
     }
+
+    let busy = false;
+    async function runAction(action) {
+        const names = selectedNames();
+        if (busy || !names.length) return;
+        busy = true;
+        render();
+        try {
+            if (await action(names)) state.selected.clear();
+        } finally {
+            busy = false;
+            render();
+        }
+    }
+
+    $('.preset-tidy-delete').addEventListener('click', () => runAction(deletePresetsWithBackup));
 
     $('.preset-tidy-search').addEventListener('input', (e) => {
         state.query = e.target.value;

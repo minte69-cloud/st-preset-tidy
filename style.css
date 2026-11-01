@@ -93,6 +93,20 @@
     opacity: 0.6;
 }
 
+.preset-tidy-actions .menu_button.disabled {
+    opacity: 0.4;
+    pointer-events: none;
+}
+
+.preset-tidy-confirm {
+    text-align: left;
+}
+
+.preset-tidy-confirm ul {
+    max-height: 40vh;
+    overflow: auto;
+}
+
 .preset-tidy-count {
     margin-right: auto;
     opacity: 0.8;
