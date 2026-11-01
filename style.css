@@ -1,0 +1,13 @@
+/* 색은 전부 실리태번 테마 변수(--SmartTheme*)를 따른다. */
+
+.preset-tidy {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    text-align: left;
+    color: var(--SmartThemeBodyColor);
+}
+
+.preset-tidy h3 {
+    margin: 0;
+}
